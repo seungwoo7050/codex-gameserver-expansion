@@ -7,8 +7,18 @@ if ! command -v apt-get >/dev/null 2>&1; then
   exit 1
 fi
 
-apt-get update
-apt-get install -y --no-install-recommends \
+APT_GET_CMD="apt-get"
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    APT_GET_CMD="sudo apt-get"
+  else
+    echo "루트 권한이 없고 sudo도 사용할 수 없습니다. 패키지를 수동으로 설치하세요." >&2
+    exit 1
+  fi
+fi
+
+${APT_GET_CMD} update
+${APT_GET_CMD} install -y --no-install-recommends \
   build-essential \
   cmake \
   git \
