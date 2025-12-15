@@ -162,8 +162,6 @@ class RatingLeaderboardFixture : public ::testing::Test {
   boost::asio::io_context ioc_;
 };
 
-}  // namespace
-
 TEST_F(RatingLeaderboardFixture, DuplicateFinalizeDoesNotDoubleApplyRating) {
   std::string token_a = RegisterAndLogin("raterA", "pw1");
   std::string token_b = RegisterAndLogin("raterB", "pw2");
