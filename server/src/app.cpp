@@ -1,6 +1,6 @@
 /*
  * 설명: 서버 수명주기와 리스닝 스레드를 관리한다.
- * 버전: v1.0.0
+ * 버전: v1.1.0
  * 관련 문서: design/protocol/contract.md
  * 테스트: server/tests/e2e/auth_flow_test.cpp, server/tests/e2e/reconnect_backpressure_test.cpp,
  *         server/tests/e2e/session_flow_test.cpp
@@ -107,9 +107,11 @@ ServerApp::ServerApp(const AppConfig& config)
   observability_ = std::make_shared<Observability>();
   coordinator_ = std::make_shared<RealtimeCoordinator>();
   coordinator_->SetObservability(observability_);
-  rating_service_ = std::make_shared<RatingService>();
-  result_repository_ = std::make_shared<ResultRepository>();
-  result_service_ = std::make_shared<ResultService>(result_repository_, rating_service_);
+  DbConfig db_config{config.db_host, config.db_port, config.db_user, config.db_password, config.db_name};
+  db_client_ = std::make_shared<MariaDbClient>(db_config);
+  rating_service_ = std::make_shared<RatingService>(db_client_);
+  result_repository_ = std::make_shared<ResultRepository>(db_client_);
+  result_service_ = std::make_shared<ResultService>(db_client_, result_repository_, rating_service_);
   session_manager_ = std::make_shared<SessionManager>(ioc_, coordinator_, result_service_,
                                                      std::chrono::milliseconds(config.session_tick_interval_ms), 5);
   match_queue_ = std::make_shared<MatchQueueService>(ioc_, session_manager_, coordinator_,

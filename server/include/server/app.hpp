@@ -1,6 +1,6 @@
 /*
  * 설명: 서버 전체 수명주기를 관리한다.
- * 버전: v1.0.0
+ * 버전: v1.1.0
  * 관련 문서: design/protocol/contract.md
  * 테스트: server/tests/e2e/auth_flow_test.cpp, server/tests/e2e/reconnect_backpressure_test.cpp,
  *         server/tests/e2e/session_flow_test.cpp, server/tests/e2e/rating_leaderboard_test.cpp
@@ -19,6 +19,7 @@
 
 #include "server/auth.hpp"
 #include "server/config.hpp"
+#include "server/db_client.hpp"
 #include "server/match_queue.hpp"
 #include "server/observability.hpp"
 #include "server/realtime.hpp"
@@ -61,6 +62,7 @@ class ServerApp {
   std::shared_ptr<ReconnectService> reconnect_service_;
   std::shared_ptr<RealtimeCoordinator> coordinator_;
   std::shared_ptr<Observability> observability_;
+  std::shared_ptr<MariaDbClient> db_client_;
   std::shared_ptr<RatingService> rating_service_;
   std::shared_ptr<ResultRepository> result_repository_;
   std::shared_ptr<ResultService> result_service_;

@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <boost/asio/connect.hpp>
@@ -11,31 +12,23 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
-#include "server/app.hpp"
 #include "server/api_response.hpp"
 
 namespace {
 
-server::AppConfig TestConfig(unsigned short port) {
-  server::AppConfig cfg{};
-  cfg.port = port;
-  cfg.db_host = "localhost";
-  cfg.db_port = 3306;
-  cfg.db_user = "app";
-  cfg.db_password = "app_pass";
-  cfg.db_name = "app_db";
-  cfg.redis_host = "localhost";
-  cfg.redis_port = 6379;
-  cfg.log_level = "info";
-  cfg.auth_token_ttl_seconds = 3600;
-  cfg.login_rate_window_seconds = 60;
-  cfg.login_rate_limit_max = 5;
-  cfg.ws_queue_limit_messages = 8;
-  cfg.ws_queue_limit_bytes = 65536;
-  cfg.match_queue_timeout_seconds = 10;
-  cfg.session_tick_interval_ms = 100;
-  cfg.ops_token = "ops-secret";
-  return cfg;
+unsigned short ResolvePort() {
+  const char* env_port = std::getenv("E2E_LB_PORT");
+  return env_port ? static_cast<unsigned short>(std::stoi(env_port)) : 8080;
+}
+
+std::string ResolveHost() {
+  const char* env_host = std::getenv("E2E_LB_HOST");
+  return env_host ? std::string{env_host} : std::string{"127.0.0.1"};
+}
+
+std::string ResolveOpsToken() {
+  const char* env_token = std::getenv("OPS_TOKEN");
+  return env_token ? std::string{env_token} : std::string{"ops-secret"};
 }
 
 struct SimpleHttpResponse {
@@ -69,17 +62,10 @@ void ExpectErrorEnvelope(const nlohmann::json& body, const std::string& code) {
 class MetricsOpsFixture : public ::testing::Test {
  protected:
   void SetUp() override {
-    config_ = TestConfig(18084);
-    app_ = std::make_unique<server::ServerApp>(config_);
-    server_thread_ = std::thread([this]() { app_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  }
-
-  void TearDown() override {
-    app_->Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
+    host_ = ResolveHost();
+    port_ = ResolvePort();
+    ops_token_ = ResolveOpsToken();
+    WaitForReady();
   }
 
   SimpleHttpResponse Get(const std::string& target, const std::string& extra_header_name = "",
@@ -87,11 +73,11 @@ class MetricsOpsFixture : public ::testing::Test {
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::resolver resolver{ioc};
     boost::beast::tcp_stream stream{ioc};
-    auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+    auto const results = resolver.resolve(host_, std::to_string(port_));
     stream.connect(results);
 
     boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::get, target, 11};
-    req.set(boost::beast::http::field::host, "localhost");
+    req.set(boost::beast::http::field::host, host_);
     req.set(boost::beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     if (!extra_header_name.empty()) {
       req.set(extra_header_name, extra_header_value);
@@ -109,9 +95,19 @@ class MetricsOpsFixture : public ::testing::Test {
     return result;
   }
 
-  server::AppConfig config_;
-  std::unique_ptr<server::ServerApp> app_;
-  std::thread server_thread_;
+  void WaitForReady() {
+    for (int i = 0; i < 10; ++i) {
+      auto res = Get("/api/health");
+      if (res.status == boost::beast::http::status::ok) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+
+  std::string host_{};
+  unsigned short port_{8080};
+  std::string ops_token_{};
 };
 
 }  // namespace
@@ -127,7 +123,7 @@ TEST_F(MetricsOpsFixture, MetricsAndOpsEndpoints) {
   EXPECT_EQ(unauthorized_ops.status, boost::beast::http::status::unauthorized);
   ExpectErrorEnvelope(unauthorized_ops.body, "unauthorized");
 
-  auto authed_ops = Get("/ops/status", "X-Ops-Token", config_.ops_token);
+  auto authed_ops = Get("/ops/status", "X-Ops-Token", ops_token_);
   ASSERT_EQ(authed_ops.status, boost::beast::http::status::ok);
   ExpectSuccessEnvelope(authed_ops.body);
   EXPECT_TRUE(authed_ops.body["data"].contains("activeSessions"));

@@ -1,6 +1,6 @@
 FROM ubuntu:22.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git libboost-all-dev libssl-dev && \
+    build-essential cmake git libboost-all-dev libssl-dev libmariadb-dev libmariadb-dev-compat && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . /app
@@ -8,7 +8,7 @@ RUN cmake -S . -B build && cmake --build build --target server_app
 
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libboost-all-dev && rm -rf /var/lib/apt/lists/*
+    libboost-all-dev libmariadb3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv
 COPY --from=build /app/build/server_app /srv/server_app
 EXPOSE 8080

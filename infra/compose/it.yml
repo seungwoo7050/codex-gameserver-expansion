@@ -1,0 +1,27 @@
+version: "3.9"
+services:
+  mariadb:
+    image: mariadb:11.2
+    environment:
+      MARIADB_ROOT_PASSWORD: root_pass
+      MARIADB_DATABASE: app_db
+      MARIADB_USER: app
+      MARIADB_PASSWORD: app_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ../db/migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

@@ -1,0 +1,91 @@
+version: "3.9"
+services:
+  mariadb:
+    image: mariadb:11.2
+    environment:
+      MARIADB_ROOT_PASSWORD: root_pass
+      MARIADB_DATABASE: app_db
+      MARIADB_USER: app
+      MARIADB_PASSWORD: app_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ../db/migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  gateway1:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    environment:
+      SERVER_PORT: 8080
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_USER: app
+      DB_PASSWORD: app_pass
+      DB_NAME: app_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OPS_TOKEN: ops-secret
+      MATCH_QUEUE_TIMEOUT_SECONDS: 2
+      SESSION_TICK_INTERVAL_MS: 50
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "18080:8080"
+  gateway2:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    environment:
+      SERVER_PORT: 8080
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_USER: app
+      DB_PASSWORD: app_pass
+      DB_NAME: app_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OPS_TOKEN: ops-secret
+      MATCH_QUEUE_TIMEOUT_SECONDS: 2
+      SESSION_TICK_INTERVAL_MS: 50
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "18081:8080"
+  matchmaking1:
+    image: alpine:3.19
+    command: ["sleep", "infinity"]
+  session1:
+    image: alpine:3.19
+    command: ["sleep", "infinity"]
+  session2:
+    image: alpine:3.19
+    command: ["sleep", "infinity"]
+  lb:
+    image: nginx:1.25
+    depends_on:
+      - gateway1
+      - gateway2
+    volumes:
+      - ../nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
