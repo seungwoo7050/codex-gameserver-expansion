@@ -1,0 +1,13 @@
+/build/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+cmake_install.cmake
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.dylib
+*.exe
+*.log

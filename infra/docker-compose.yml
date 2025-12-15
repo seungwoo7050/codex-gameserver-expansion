@@ -1,0 +1,58 @@
+version: '3.9'
+services:
+  server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    environment:
+      - SERVER_PORT=8080
+      - DB_HOST=mariadb
+      - DB_PORT=3306
+      - DB_USER=app
+      - DB_PASSWORD=app_pass
+      - DB_NAME=app_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MATCH_QUEUE_TIMEOUT_SECONDS=10
+      - SESSION_TICK_INTERVAL_MS=100
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mariadb
+      - redis
+    networks:
+      - backend
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      - MARIADB_ROOT_PASSWORD=root_pass
+      - MARIADB_DATABASE=app_db
+      - MARIADB_USER=app
+      - MARIADB_PASSWORD=app_pass
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    networks:
+      - backend
+
+  redis:
+    image: redis:7
+    networks:
+      - backend
+
+  nginx:
+    image: nginx:1.27
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - server
+    networks:
+      - backend
+
+volumes:
+  mariadb_data:
+
+networks:
+  backend:
