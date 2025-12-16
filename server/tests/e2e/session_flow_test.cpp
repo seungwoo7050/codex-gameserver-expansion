@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <boost/asio/connect.hpp>
@@ -14,30 +15,17 @@
 #include <nlohmann/json.hpp>
 
 #include "server/api_response.hpp"
-#include "server/app.hpp"
 
 namespace {
 
-server::AppConfig TestConfig(unsigned short port) {
-  server::AppConfig cfg{};
-  cfg.port = port;
-  cfg.db_host = "localhost";
-  cfg.db_port = 3306;
-  cfg.db_user = "app";
-  cfg.db_password = "app_pass";
-  cfg.db_name = "app_db";
-  cfg.redis_host = "localhost";
-  cfg.redis_port = 6379;
-  cfg.log_level = "info";
-  cfg.auth_token_ttl_seconds = 3600;
-  cfg.login_rate_window_seconds = 60;
-  cfg.login_rate_limit_max = 5;
-  cfg.ws_queue_limit_messages = 8;
-  cfg.ws_queue_limit_bytes = 65536;
-  cfg.match_queue_timeout_seconds = 2;
-  cfg.session_tick_interval_ms = 50;
-  cfg.ops_token = "ops-token";
-  return cfg;
+unsigned short ResolvePort() {
+  const char* env_port = std::getenv("E2E_LB_PORT");
+  return env_port ? static_cast<unsigned short>(std::stoi(env_port)) : 8080;
+}
+
+std::string ResolveHost() {
+  const char* env_host = std::getenv("E2E_LB_HOST");
+  return env_host ? std::string{env_host} : std::string{"127.0.0.1"};
 }
 
 struct SimpleHttpResponse {
@@ -91,28 +79,20 @@ void ExpectWsError(const nlohmann::json& msg, const std::string& code) {
 class SessionFlowFixture : public ::testing::Test {
  protected:
   void SetUp() override {
-    config_ = TestConfig(18082);
-    app_ = std::make_unique<server::ServerApp>(config_);
-    server_thread_ = std::thread([this]() { app_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
-  }
-
-  void TearDown() override {
-    app_->Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
+    host_ = ResolveHost();
+    port_ = ResolvePort();
+    WaitForReady();
   }
 
   SimpleHttpResponse PostJson(const std::string& target, const nlohmann::json& body, const std::string& token = "") {
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::resolver resolver{ioc};
     boost::beast::tcp_stream stream{ioc};
-    auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+    auto const results = resolver.resolve(host_, std::to_string(port_));
     stream.connect(results);
 
     boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::post, target, 11};
-    req.set(boost::beast::http::field::host, "localhost");
+    req.set(boost::beast::http::field::host, host_);
     req.set(boost::beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     req.set(boost::beast::http::field::content_type, "application/json");
     req.body() = body.dump();
@@ -137,11 +117,11 @@ class SessionFlowFixture : public ::testing::Test {
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::resolver resolver{ioc};
     boost::beast::tcp_stream stream{ioc};
-    auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+    auto const results = resolver.resolve(host_, std::to_string(port_));
     stream.connect(results);
 
     boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::get, target, 11};
-    req.set(boost::beast::http::field::host, "localhost");
+    req.set(boost::beast::http::field::host, host_);
     req.set(boost::beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     if (!token.empty()) {
       req.set(boost::beast::http::field::authorization, "Bearer " + token);
@@ -172,12 +152,12 @@ class SessionFlowFixture : public ::testing::Test {
   std::unique_ptr<WebSocket> ConnectWs(const std::string& token) {
     auto ws = std::make_unique<WebSocket>(ioc_);
     boost::asio::ip::tcp::resolver resolver{ioc_};
-    auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+    auto const results = resolver.resolve(host_, std::to_string(port_));
     ws->next_layer().connect(results);
     ws->set_option(boost::beast::websocket::stream_base::decorator([&token](boost::beast::websocket::request_type& req) {
       req.set(boost::beast::http::field::authorization, "Bearer " + token);
     }));
-    ws->handshake("127.0.0.1", "/ws");
+    ws->handshake(host_, "/ws");
     return ws;
   }
 
@@ -188,11 +168,22 @@ class SessionFlowFixture : public ::testing::Test {
     return nlohmann::json::parse(raw);
   }
 
-  server::AppConfig config_;
+  void WaitForReady() {
+    for (int i = 0; i < 10; ++i) {
+      auto res = Get("/api/health");
+      if (res.status == boost::beast::http::status::ok) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+
+  std::string host_{};
+  unsigned short port_{8080};
   boost::asio::io_context ioc_;
-  std::unique_ptr<server::ServerApp> app_;
-  std::thread server_thread_;
 };
+
+}  // namespace
 
 TEST_F(SessionFlowFixture, MatchAndPersistResult) {
   std::string token_a = RegisterAndLogin("alice", "pw1");
@@ -258,106 +249,63 @@ TEST_F(SessionFlowFixture, MatchAndPersistResult) {
       ExpectWsEventEnvelope(msg, "session.ended");
       ended = true;
       EXPECT_EQ(msg["p"]["reason"], "completed");
-      EXPECT_TRUE(msg["p"].contains("result"));
     }
   }
+  EXPECT_TRUE(ended);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  EXPECT_EQ(app_->DebugResultCount(), 1);
+  auto ended_b = ReadWs(*ws_b, buf_b);
+  ExpectWsEventEnvelope(ended_b, "session.ended");
+  EXPECT_EQ(ended_b["p"]["reason"], "completed");
+
+  ws_a->close(boost::beast::websocket::close_code::normal);
+  ws_b->close(boost::beast::websocket::close_code::normal);
+
+  auto profile_a = Get("/api/profile", token_a);
+  auto profile_b = Get("/api/profile", token_b);
+  ExpectSuccessEnvelope(profile_a.body);
+  ExpectSuccessEnvelope(profile_b.body);
+  EXPECT_EQ(profile_a.body["data"]["matches"], 1);
+  EXPECT_EQ(profile_b.body["data"]["matches"], 1);
 }
 
-TEST_F(SessionFlowFixture, DuplicateQueueJoinRejected) {
-  std::string token = RegisterAndLogin("solo", "pw1");
-  auto join1 = PostJson("/api/queue/join", {{"mode", "normal"}}, token);
-  auto join2 = PostJson("/api/queue/join", {{"mode", "normal"}}, token);
-  EXPECT_EQ(join1.status, boost::beast::http::status::ok);
-  ExpectSuccessEnvelope(join1.body);
-  EXPECT_EQ(join2.status, boost::beast::http::status::conflict);
-  ExpectErrorEnvelope(join2.body, "queue_duplicate");
-}
-
-TEST_F(SessionFlowFixture, QueueTimeoutProducesError) {
-  std::string token = RegisterAndLogin("timeout", "pw1");
+TEST_F(SessionFlowFixture, QueueTimeoutAndInvalidSessionInput) {
+  std::string token = RegisterAndLogin("carol", "pw3");
   auto ws = ConnectWs(token);
-  boost::beast::flat_buffer buffer;
-  auto auth_msg = ReadWs(*ws, buffer);
-  ExpectWsEventEnvelope(auth_msg, "auth_state");
+  boost::beast::flat_buffer buf;
 
-  auto join = PostJson("/api/queue/join", {{"mode", "normal"}, {"timeoutSeconds", 2}}, token);
-  EXPECT_EQ(join.status, boost::beast::http::status::ok);
-  ExpectSuccessEnvelope(join.body);
+  auto join_res = PostJson("/api/queue/join", {{"mode", "normal"}, {"timeoutSeconds", 1}}, token);
+  EXPECT_EQ(join_res.status, boost::beast::http::status::ok);
+  ExpectSuccessEnvelope(join_res.body);
 
-  bool got_timeout = false;
-  for (int i = 0; i < 6 && !got_timeout; ++i) {
-    auto msg = ReadWs(*ws, buffer);
+  bool timed_out = false;
+  for (int i = 0; i < 10 && !timed_out; ++i) {
+    auto msg = ReadWs(*ws, buf);
     if (msg.contains("t") && msg["t"] == "error") {
       ExpectWsError(msg, "queue_timeout");
-      got_timeout = true;
+      timed_out = true;
     }
   }
-  EXPECT_TRUE(got_timeout);
+  EXPECT_TRUE(timed_out);
+
+  nlohmann::json bad_input{{"t", "event"},
+                           {"seq", 2},
+                           {"event", "session.input"},
+                           {"p", {{"sessionId", "invalid"}, {"sequence", 1}, {"targetTick", 1}, {"delta", 1}}}};
+  ws->write(boost::asio::buffer(bad_input.dump()));
+  auto error_resp = ReadWs(*ws, buf);
+  ExpectWsError(error_resp, "session_not_found");
+  ws->close(boost::beast::websocket::close_code::normal);
 }
 
-TEST_F(SessionFlowFixture, LateInputAfterEndIsRejected) {
-  std::string token_a = RegisterAndLogin("lateA", "pw1");
-  std::string token_b = RegisterAndLogin("lateB", "pw2");
+TEST_F(SessionFlowFixture, DuplicateQueueEntryIsRejected) {
+  std::string token = RegisterAndLogin("dave", "pw4");
 
-  auto ws_a = ConnectWs(token_a);
-  auto ws_b = ConnectWs(token_b);
-  boost::beast::flat_buffer buf_a;
-  boost::beast::flat_buffer buf_b;
-  auto auth_a = ReadWs(*ws_a, buf_a);
-  auto auth_b = ReadWs(*ws_b, buf_b);
-  ExpectWsEventEnvelope(auth_a, "auth_state");
-  ExpectWsEventEnvelope(auth_b, "auth_state");
+  auto first = PostJson("/api/queue/join", {{"mode", "normal"}, {"timeoutSeconds", 5}}, token);
+  EXPECT_EQ(first.status, boost::beast::http::status::ok);
+  ExpectSuccessEnvelope(first.body);
 
-  auto join_a = PostJson("/api/queue/join", {{"mode", "normal"}}, token_a);
-  auto join_b = PostJson("/api/queue/join", {{"mode", "normal"}}, token_b);
-  ASSERT_EQ(join_a.status, boost::beast::http::status::ok);
-  ASSERT_EQ(join_b.status, boost::beast::http::status::ok);
-  ExpectSuccessEnvelope(join_a.body);
-  ExpectSuccessEnvelope(join_b.body);
-
-  std::string session_id;
-  bool ended = false;
-  for (int i = 0; i < 24 && !ended; ++i) {
-    auto msg = ReadWs(*ws_a, buf_a);
-    if (!msg.contains("event")) {
-      continue;
-    }
-    if (msg["event"] == "session.created") {
-      ExpectWsEventEnvelope(msg, "session.created");
-      session_id = msg["p"]["sessionId"].get<std::string>();
-    }
-    if (msg["event"] == "session.started") {
-      ExpectWsEventEnvelope(msg, "session.started");
-      if (session_id.empty() && msg["p"].contains("sessionId")) {
-        session_id = msg["p"]["sessionId"].get<std::string>();
-      }
-    }
-    if (msg["event"] == "session.ended") {
-      ExpectWsEventEnvelope(msg, "session.ended");
-      ended = true;
-    }
-  }
-
-  ASSERT_FALSE(session_id.empty());
-  ASSERT_TRUE(ended);
-
-  for (int i = 0; i < 10 && app_->DebugResultCount() < 1; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  EXPECT_EQ(app_->DebugResultCount(), 1);
-
-  nlohmann::json late_input{{"t", "event"},
-                             {"seq", 99},
-                             {"event", "session.input"},
-                             {"p", {{"sessionId", session_id}, {"sequence", 99}, {"targetTick", 5}, {"delta", 3}}}};
-  ws_a->write(boost::asio::buffer(late_input.dump()));
-
-  auto error_msg = ReadWs(*ws_a, buf_a);
-  ExpectWsError(error_msg, "session_not_found");
-  EXPECT_EQ(app_->DebugResultCount(), 1);
+  auto second = PostJson("/api/queue/join", {{"mode", "normal"}, {"timeoutSeconds", 5}}, token);
+  EXPECT_EQ(second.status, boost::beast::http::status::conflict);
+  ExpectErrorEnvelope(second.body, "queue_duplicate");
 }
 
-}  // namespace

@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <boost/asio/connect.hpp>
@@ -14,30 +15,17 @@
 #include <nlohmann/json.hpp>
 
 #include "server/api_response.hpp"
-#include "server/app.hpp"
 
 namespace {
 
-server::AppConfig TestConfig(unsigned short port) {
-  server::AppConfig cfg;
-  cfg.port = port;
-  cfg.db_host = "localhost";
-  cfg.db_port = 3306;
-  cfg.db_user = "app";
-  cfg.db_password = "app_pass";
-  cfg.db_name = "app_db";
-  cfg.redis_host = "localhost";
-  cfg.redis_port = 6379;
-  cfg.log_level = "info";
-  cfg.auth_token_ttl_seconds = 3600;
-  cfg.login_rate_window_seconds = 60;
-  cfg.login_rate_limit_max = 5;
-  cfg.ws_queue_limit_messages = 8;
-  cfg.ws_queue_limit_bytes = 256;
-  cfg.match_queue_timeout_seconds = 10;
-  cfg.session_tick_interval_ms = 100;
-  cfg.ops_token = "ops-token";
-  return cfg;
+unsigned short ResolvePort() {
+  const char* env_port = std::getenv("E2E_LB_PORT");
+  return env_port ? static_cast<unsigned short>(std::stoi(env_port)) : 8080;
+}
+
+std::string ResolveHost() {
+  const char* env_host = std::getenv("E2E_LB_HOST");
+  return env_host ? std::string{env_host} : std::string{"127.0.0.1"};
 }
 
 struct SimpleHttpResponse {
@@ -48,28 +36,20 @@ struct SimpleHttpResponse {
 class BackpressureServerFixture : public ::testing::Test {
  protected:
   void SetUp() override {
-    config_ = TestConfig(18081);
-    app_ = std::make_unique<server::ServerApp>(config_);
-    server_thread_ = std::thread([this]() { app_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  }
-
-  void TearDown() override {
-    app_->Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
+    host_ = ResolveHost();
+    port_ = ResolvePort();
+    WaitForReady();
   }
 
   SimpleHttpResponse PostJson(const std::string& target, const nlohmann::json& body, const std::string& token = "") {
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::resolver resolver{ioc};
     boost::beast::tcp_stream stream{ioc};
-    auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+    auto const results = resolver.resolve(host_, std::to_string(port_));
     stream.connect(results);
 
     boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::post, target, 11};
-    req.set(boost::beast::http::field::host, "localhost");
+    req.set(boost::beast::http::field::host, host_);
     req.set(boost::beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     req.set(boost::beast::http::field::content_type, "application/json");
     req.body() = body.dump();
@@ -77,6 +57,29 @@ class BackpressureServerFixture : public ::testing::Test {
     if (!token.empty()) {
       req.set(boost::beast::http::field::authorization, "Bearer " + token);
     }
+
+    boost::beast::http::write(stream, req);
+
+    boost::beast::flat_buffer buffer;
+    boost::beast::http::response<boost::beast::http::string_body> res;
+    boost::beast::http::read(stream, buffer, res);
+
+    SimpleHttpResponse result{res.result(), nlohmann::json::parse(res.body())};
+    boost::beast::error_code ec;
+    stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+    return result;
+  }
+
+  SimpleHttpResponse Get(const std::string& target) {
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::resolver resolver{ioc};
+    boost::beast::tcp_stream stream{ioc};
+    auto const results = resolver.resolve(host_, std::to_string(port_));
+    stream.connect(results);
+
+    boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::get, target, 11};
+    req.set(boost::beast::http::field::host, host_);
+    req.set(boost::beast::http::field::user_agent, BOOST_BEAST_VERSION_STRING);
 
     boost::beast::http::write(stream, req);
 
@@ -101,9 +104,18 @@ class BackpressureServerFixture : public ::testing::Test {
     return login_res.body["data"]["token"].get<std::string>();
   }
 
-  server::AppConfig config_;
-  std::unique_ptr<server::ServerApp> app_;
-  std::thread server_thread_;
+  void WaitForReady() {
+    for (int i = 0; i < 10; ++i) {
+      auto res = Get("/api/health");
+      if (res.status == boost::beast::http::status::ok) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+
+  std::string host_{};
+  unsigned short port_{8080};
 };
 
 }  // namespace
@@ -114,12 +126,12 @@ TEST_F(BackpressureServerFixture, SlowConsumerTriggersClose) {
   boost::asio::io_context ioc;
   boost::asio::ip::tcp::resolver resolver{ioc};
   boost::beast::websocket::stream<boost::beast::tcp_stream> ws{ioc};
-  auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+  auto const results = resolver.resolve(host_, std::to_string(port_));
   ws.next_layer().connect(results);
   ws.set_option(boost::beast::websocket::stream_base::decorator([&token](boost::beast::websocket::request_type& req) {
     req.set(boost::beast::http::field::authorization, "Bearer " + token);
   }));
-  ws.handshake("127.0.0.1", "/ws");
+  ws.handshake(host_, "/ws");
 
   boost::beast::flat_buffer buffer;
   bool closed_by_exception = false;
@@ -146,12 +158,12 @@ TEST_F(BackpressureServerFixture, ReconnectAndResyncReturnsSnapshot) {
   boost::asio::io_context ioc;
   boost::asio::ip::tcp::resolver resolver{ioc};
   boost::beast::websocket::stream<boost::beast::tcp_stream> ws{ioc};
-  auto const results = resolver.resolve("127.0.0.1", std::to_string(config_.port));
+  auto const results = resolver.resolve(host_, std::to_string(port_));
   ws.next_layer().connect(results);
   ws.set_option(boost::beast::websocket::stream_base::decorator([&token](boost::beast::websocket::request_type& req) {
     req.set(boost::beast::http::field::authorization, "Bearer " + token);
   }));
-  ws.handshake("127.0.0.1", "/ws");
+  ws.handshake(host_, "/ws");
 
   boost::beast::flat_buffer buffer;
   boost::system::error_code ec;
@@ -166,7 +178,7 @@ TEST_F(BackpressureServerFixture, ReconnectAndResyncReturnsSnapshot) {
   ws2.set_option(boost::beast::websocket::stream_base::decorator([&token](boost::beast::websocket::request_type& req) {
     req.set(boost::beast::http::field::authorization, "Bearer " + token);
   }));
-  ws2.handshake("127.0.0.1", "/ws");
+  ws2.handshake(host_, "/ws");
 
   buffer.consume(buffer.size());
   ws2.read(buffer, ec);
@@ -186,4 +198,3 @@ TEST_F(BackpressureServerFixture, ReconnectAndResyncReturnsSnapshot) {
   EXPECT_EQ(resync_msg["p"]["snapshot"]["state"], "auth_only");
   EXPECT_EQ(resync_msg["p"]["snapshot"]["user"]["username"], "reuser");
 }
-

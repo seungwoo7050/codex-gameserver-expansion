@@ -1,6 +1,6 @@
 /*
- * 설명: Elo 기반 레이팅 연산과 리더보드 페이지네이션을 수행한다.
- * 버전: v1.0.0
+ * 설명: MariaDB 기반 레이팅 연산과 리더보드를 제공한다.
+ * 버전: v1.1.0
  * 관련 문서: design/protocol/contract.md, design/server/v0.6.0-rating-leaderboard.md
  * 테스트: server/tests/unit/rating_update_test.cpp, server/tests/e2e/rating_leaderboard_test.cpp
  */
@@ -8,84 +8,150 @@
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
+#include <unordered_map>
+
+#include <mariadb/errmsg.h>
 
 namespace server {
+namespace {
+int ToInt(const char* value) { return value ? std::stoi(value) : 0; }
+}  // namespace
 
-RatingService::RatingService() = default;
+RatingService::RatingService(std::shared_ptr<MariaDbClient> db_client) : db_client_(std::move(db_client)) {}
 
 void RatingService::EnsureUser(int user_id, const std::string& username) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto it = entries_.find(user_id);
-  if (it == entries_.end()) {
-    entries_.emplace(user_id, Entry{username, initial_rating_, 0, 0});
-    return;
-  }
-  if (!username.empty()) {
-    it->second.username = username;
+  db_client_->ExecuteTransactionWithRetry([&](MYSQL* conn) {
+    EnsureUserInTx(conn, user_id, username);
+    return true;
+  });
+}
+
+void RatingService::EnsureUserInTx(MYSQL* conn, int user_id, const std::string& username) {
+  std::ostringstream oss;
+  std::string escaped = db_client_->Escape(conn, username);
+  std::string username_expr = username.empty() ? "username" : "VALUES(username)";
+  oss << "INSERT INTO ratings(user_id, username, rating, wins, losses, updated_at) VALUES (" << user_id << ", '"
+      << escaped << "', " << initial_rating_ << ", 0, 0, NOW(6)) ON DUPLICATE KEY UPDATE username = " << username_expr
+      << ", updated_at = NOW(6);";
+  if (mysql_query(conn, oss.str().c_str()) != 0) {
+    db_client_->RaiseError(conn, "사용자 보장 실패");
   }
 }
 
-RatingSummary RatingService::ApplyMatchResult(int winner_id, int loser_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto ensure = [this](int user_id) -> Entry& {
-    auto it = entries_.find(user_id);
-    if (it == entries_.end()) {
-      auto inserted = entries_.emplace(user_id, Entry{"", initial_rating_, 0, 0});
-      return inserted.first->second;
-    }
-    return it->second;
-  };
+RatingSummary RatingService::ApplyMatchResultInTx(MYSQL* conn, int winner_id, int loser_id) {
+  EnsureUserInTx(conn, winner_id, "");
+  EnsureUserInTx(conn, loser_id, "");
+  return ApplyEloUpdate(conn, winner_id, loser_id);
+}
 
-  Entry& winner = ensure(winner_id);
-  Entry& loser = ensure(loser_id);
+RatingSummary RatingService::ApplyEloUpdate(MYSQL* conn, int winner_id, int loser_id) {
+  std::ostringstream select;
+  select << "SELECT user_id, username, rating, wins, losses FROM ratings WHERE user_id IN (" << winner_id << ","
+         << loser_id << ") FOR UPDATE;";
+  if (mysql_query(conn, select.str().c_str()) != 0) {
+    db_client_->RaiseError(conn, "레이팅 조회 실패");
+  }
+  MYSQL_RES* res = mysql_store_result(conn);
+  if (!res) {
+    db_client_->RaiseError(conn, "레이팅 결과 비어 있음");
+  }
+  std::unordered_map<int, RatingSummary> current;
+  MYSQL_ROW row;
+  while ((row = mysql_fetch_row(res)) != nullptr) {
+    int user_id = ToInt(row[0]);
+    current[user_id] = BuildSummary(user_id, row);
+  }
+  mysql_free_result(res);
+  auto winner_it = current.find(winner_id);
+  auto loser_it = current.find(loser_id);
+  if (winner_it == current.end() || loser_it == current.end()) {
+    throw DbException("레이팅 조회 중 누락", 0, false);
+  }
 
-  double expected_winner = ExpectedScore(winner.rating, loser.rating);
-  double expected_loser = ExpectedScore(loser.rating, winner.rating);
+  double expected_winner = ExpectedScore(winner_it->second.rating, loser_it->second.rating);
+  double expected_loser = ExpectedScore(loser_it->second.rating, winner_it->second.rating);
 
-  winner.rating = ApplyElo(winner.rating, expected_winner, 1.0);
-  loser.rating = ApplyElo(loser.rating, expected_loser, 0.0);
-  winner.wins += 1;
-  loser.losses += 1;
+  int winner_next = ApplyElo(winner_it->second.rating, expected_winner, 1.0);
+  int loser_next = ApplyElo(loser_it->second.rating, expected_loser, 0.0);
 
-  return RatingSummary{winner_id, winner.username, winner.rating, winner.wins, winner.losses};
+  std::ostringstream update_winner;
+  update_winner << "UPDATE ratings SET rating=" << winner_next << ", wins=" << (winner_it->second.wins + 1)
+                << ", updated_at=NOW(6) WHERE user_id=" << winner_id << ";";
+  if (mysql_query(conn, update_winner.str().c_str()) != 0) {
+    db_client_->RaiseError(conn, "승자 갱신 실패");
+  }
+
+  std::ostringstream update_loser;
+  update_loser << "UPDATE ratings SET rating=" << loser_next << ", losses=" << (loser_it->second.losses + 1)
+               << ", updated_at=NOW(6) WHERE user_id=" << loser_id << ";";
+  if (mysql_query(conn, update_loser.str().c_str()) != 0) {
+    db_client_->RaiseError(conn, "패자 갱신 실패");
+  }
+
+  return RatingSummary{winner_id, winner_it->second.username, winner_next, winner_it->second.wins + 1,
+                       winner_it->second.losses};
 }
 
 std::optional<RatingSummary> RatingService::GetSummary(int user_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto it = entries_.find(user_id);
-  if (it == entries_.end()) {
-    return std::nullopt;
-  }
-  return RatingSummary{user_id, it->second.username, it->second.rating, it->second.wins, it->second.losses};
+  std::optional<RatingSummary> result;
+  db_client_->WithConnectionRetry([&](MYSQL* conn) {
+    std::ostringstream oss;
+    oss << "SELECT user_id, username, rating, wins, losses FROM ratings WHERE user_id=" << user_id << ";";
+    if (mysql_query(conn, oss.str().c_str()) != 0) {
+      db_client_->RaiseError(conn, "프로필 조회 실패");
+    }
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (!res) {
+      db_client_->RaiseError(conn, "프로필 결과 없음");
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    if (row) {
+      result = BuildSummary(user_id, row);
+    }
+    mysql_free_result(res);
+  });
+  return result;
 }
 
 LeaderboardPage RatingService::GetLeaderboard(std::size_t page, std::size_t size) {
-  std::vector<std::pair<int, Entry>> items;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& kv : entries_) {
-      items.emplace_back(kv.first, kv.second);
+  LeaderboardPage page_data{0, {}};
+  db_client_->WithConnectionRetry([&](MYSQL* conn) {
+    std::ostringstream count_sql;
+    count_sql << "SELECT COUNT(*) FROM ratings;";
+    if (mysql_query(conn, count_sql.str().c_str()) != 0) {
+      db_client_->RaiseError(conn, "리더보드 카운트 실패");
     }
-  }
-  std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-    if (a.second.rating == b.second.rating) {
-      return a.first < b.first;
+    MYSQL_RES* count_res = mysql_store_result(conn);
+    if (!count_res) {
+      db_client_->RaiseError(conn, "리더보드 카운트 결과 없음");
     }
-    return a.second.rating > b.second.rating;
-  });
+    MYSQL_ROW count_row = mysql_fetch_row(count_res);
+    page_data.total = count_row ? static_cast<std::size_t>(std::stoull(count_row[0])) : 0;
+    mysql_free_result(count_res);
 
-  std::size_t total = items.size();
-  std::size_t start = (page - 1) * size;
-  std::size_t end = std::min(start + size, total);
-  std::vector<RatingSummary> summaries;
-  if (start < total) {
-    summaries.reserve(end - start);
-    for (std::size_t i = start; i < end; ++i) {
-      summaries.push_back(RatingSummary{items[i].first, items[i].second.username, items[i].second.rating,
-                                        items[i].second.wins, items[i].second.losses});
+    std::size_t offset = (page - 1) * size;
+    std::ostringstream query_sql;
+    query_sql << "SELECT user_id, username, rating, wins, losses FROM ratings ORDER BY rating DESC, user_id ASC LIMIT "
+              << size << " OFFSET " << offset << ";";
+    if (mysql_query(conn, query_sql.str().c_str()) != 0) {
+      db_client_->RaiseError(conn, "리더보드 조회 실패");
     }
-  }
-  return LeaderboardPage{total, summaries};
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (!res) {
+      db_client_->RaiseError(conn, "리더보드 결과 없음");
+    }
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != nullptr) {
+      page_data.entries.push_back(BuildSummary(ToInt(row[0]), row));
+    }
+    mysql_free_result(res);
+  });
+  return page_data;
+}
+
+RatingSummary RatingService::BuildSummary(int user_id, MYSQL_ROW row) const {
+  return RatingSummary{user_id, row[1] ? row[1] : "", ToInt(row[2]), ToInt(row[3]), ToInt(row[4])};
 }
 
 double RatingService::ExpectedScore(int rating_a, int rating_b) const {

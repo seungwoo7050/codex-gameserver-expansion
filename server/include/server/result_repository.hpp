@@ -1,6 +1,6 @@
 /*
- * 설명: 세션 종료 결과를 idempotent하게 저장하는 저장소를 정의한다.
- * 버전: v1.0.0
+ * 설명: 세션 종료 결과를 MariaDB에 저장하고 중복을 DB 제약으로 차단한다.
+ * 버전: v1.1.0
  * 관련 문서: design/server/v0.6.0-rating-leaderboard.md
  * 테스트: server/tests/e2e/session_flow_test.cpp, server/tests/e2e/rating_leaderboard_test.cpp
  */
@@ -8,12 +8,13 @@
 
 #include <chrono>
 #include <cstddef>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
 
 #include <nlohmann/json.hpp>
+#include <mariadb/mysql.h>
+
+#include "server/db_client.hpp"
 
 namespace server {
 
@@ -29,14 +30,20 @@ struct MatchResultRecord {
 
 class ResultRepository {
  public:
- bool SaveIfAbsent(const MatchResultRecord& record);
-  bool Exists(const std::string& session_id) const;
+  explicit ResultRepository(std::shared_ptr<MariaDbClient> db_client);
+
+  bool InsertMatchResult(MYSQL* conn, const MatchResultRecord& record);
+  bool InsertRatingGuard(MYSQL* conn, const std::string& match_id, int user_id);
+
   std::size_t Count() const;
   std::optional<MatchResultRecord> Find(const std::string& session_id) const;
+  void ClearAll() const;
 
  private:
-  mutable std::mutex mutex_;
-  std::unordered_map<std::string, MatchResultRecord> records_;
+  MatchResultRecord BuildRecord(MYSQL_ROW row) const;
+  std::string ToTimestamp(const std::chrono::system_clock::time_point& tp) const;
+
+  std::shared_ptr<MariaDbClient> db_client_;
 };
 
 }  // namespace server

@@ -6,11 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
+find_package(PkgConfig REQUIRED)
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 find_package(Boost 1.70 REQUIRED COMPONENTS system thread)
 find_package(OpenSSL REQUIRED)
+pkg_check_modules(MARIADB REQUIRED mariadb)
 
 FetchContent_Declare(
   nlohmann_json
@@ -28,6 +30,7 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_library(server_core
+  src/db_client.cpp
   src/api_response.cpp
   src/auth.cpp
   src/app.cpp
@@ -45,9 +48,11 @@ add_library(server_core
 )
 
 target_include_directories(server_core PUBLIC include)
+target_include_directories(server_core PRIVATE ${MARIADB_INCLUDE_DIRS})
 
 target_link_libraries(server_core
   PUBLIC Boost::system Boost::thread Threads::Threads nlohmann_json::nlohmann_json OpenSSL::SSL OpenSSL::Crypto
+  PUBLIC ${MARIADB_LIBRARIES}
 )
 
 target_compile_definitions(server_core PRIVATE BOOST_BEAST_USE_STD_STRING_VIEW)
@@ -67,6 +72,9 @@ target_link_libraries(unit_simulation_determinism_test PRIVATE server_core GTest
 add_executable(unit_rating_update_test tests/unit/rating_update_test.cpp)
 target_link_libraries(unit_rating_update_test PRIVATE server_core GTest::gtest_main)
 
+add_executable(it_finalize_test tests/it/finalize_it_test.cpp)
+target_link_libraries(it_finalize_test PRIVATE server_core GTest::gtest_main Boost::system Boost::thread)
+
 add_executable(e2e_auth_flow_test tests/e2e/auth_flow_test.cpp)
 target_link_libraries(e2e_auth_flow_test PRIVATE server_core GTest::gtest_main Boost::system Boost::thread)
 
@@ -82,11 +90,12 @@ add_executable(e2e_metrics_ops_test tests/e2e/metrics_ops_test.cpp)
 target_link_libraries(e2e_metrics_ops_test PRIVATE server_core GTest::gtest_main Boost::system Boost::thread)
 
 include(GoogleTest)
-gtest_discover_tests(unit_json_envelope_test)
-gtest_discover_tests(unit_simulation_determinism_test)
-gtest_discover_tests(unit_rating_update_test)
-gtest_discover_tests(e2e_auth_flow_test)
-gtest_discover_tests(e2e_reconnect_backpressure_test)
-gtest_discover_tests(e2e_session_flow_test)
-gtest_discover_tests(e2e_rating_leaderboard_test)
-gtest_discover_tests(e2e_metrics_ops_test)
+gtest_discover_tests(unit_json_envelope_test PROPERTIES LABELS "unit")
+gtest_discover_tests(unit_simulation_determinism_test PROPERTIES LABELS "unit")
+gtest_discover_tests(unit_rating_update_test PROPERTIES LABELS "it")
+gtest_discover_tests(it_finalize_test PROPERTIES LABELS "it")
+gtest_discover_tests(e2e_auth_flow_test PROPERTIES LABELS "e2e")
+gtest_discover_tests(e2e_reconnect_backpressure_test PROPERTIES LABELS "e2e")
+gtest_discover_tests(e2e_session_flow_test PROPERTIES LABELS "e2e")
+gtest_discover_tests(e2e_rating_leaderboard_test PROPERTIES LABELS "e2e")
+gtest_discover_tests(e2e_metrics_ops_test PROPERTIES LABELS "e2e")
