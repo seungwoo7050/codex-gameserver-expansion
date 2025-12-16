@@ -8,18 +8,31 @@ trap 'docker compose -f "$COMPOSE_FILE" down -v' EXIT
 docker compose -f "$COMPOSE_FILE" up -d
 READY=0
 for _ in {1..30}; do
-  if docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb-admin ping -h localhost --silent; then
+  if docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb-admin ping --protocol=TCP -h 127.0.0.1 --silent; then
     READY=1
     break
   fi
   sleep 2
 done
 if [[ "$READY" -ne 1 ]]; then
-  echo "MariaDB 준비 실패" >&2
+  echo "MariaDB TCP 준비 실패" >&2
   exit 1
 fi
 
 ROOT_CONN_OPTS=(--user=root --password=root_pass --host=127.0.0.1 --protocol=TCP)
+
+BOOTSTRAP_READY=0
+for _ in {1..15}; do
+  if docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb "${ROOT_CONN_OPTS[@]}" -e 'SELECT 1' >/dev/null 2>&1; then
+    BOOTSTRAP_READY=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$BOOTSTRAP_READY" -ne 1 ]]; then
+  echo "MariaDB 부트스트랩 확인 실패" >&2
+  exit 1
+fi
 
 docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb "${ROOT_CONN_OPTS[@]}" <<'SQL'
 CREATE DATABASE IF NOT EXISTS app_db;
