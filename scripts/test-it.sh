@@ -20,7 +20,7 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 
 for f in "$ROOT_DIR"/infra/db/migrations/*.sql; do
-  docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=app --password=app_pass app_db < "$f"
+  docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=root --password=root_pass app_db < "$f"
 done
 
 "$ROOT_DIR/scripts/build.sh" Debug
