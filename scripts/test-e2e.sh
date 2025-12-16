@@ -19,6 +19,15 @@ if [[ "$READY" -ne 1 ]]; then
   exit 1
 fi
 
+docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=root --password=root_pass <<'SQL'
+CREATE DATABASE IF NOT EXISTS app_db;
+CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'app_pass';
+CREATE USER IF NOT EXISTS 'app'@'localhost' IDENTIFIED BY 'app_pass';
+GRANT ALL PRIVILEGES ON app_db.* TO 'app'@'%';
+GRANT ALL PRIVILEGES ON app_db.* TO 'app'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+
 for f in "$ROOT_DIR"/infra/db/migrations/*.sql; do
   docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=root --password=root_pass app_db < "$f"
 done
