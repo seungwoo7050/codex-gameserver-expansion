@@ -19,7 +19,9 @@ if [[ "$READY" -ne 1 ]]; then
   exit 1
 fi
 
-docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=root --password=root_pass <<'SQL'
+ROOT_CONN_OPTS=(--user=root --password=root_pass --host=127.0.0.1 --protocol=TCP)
+
+docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb "${ROOT_CONN_OPTS[@]}" <<'SQL'
 CREATE DATABASE IF NOT EXISTS app_db;
 CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'app_pass';
 CREATE USER IF NOT EXISTS 'app'@'localhost' IDENTIFIED BY 'app_pass';
@@ -29,7 +31,7 @@ FLUSH PRIVILEGES;
 SQL
 
 for f in "$ROOT_DIR"/infra/db/migrations/*.sql; do
-  docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb --user=root --password=root_pass app_db < "$f"
+  docker compose -f "$COMPOSE_FILE" exec -T mariadb mariadb "${ROOT_CONN_OPTS[@]}" app_db < "$f"
 done
 
 LB_READY=0
